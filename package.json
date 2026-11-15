@@ -1,0 +1,11 @@
+{
+  "name": "free-model-aggregator",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "A free AI model aggregator: routes each request to the best free model across ten providers, with clean failover.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test "tests/*.test.ts""
+  }
+}
