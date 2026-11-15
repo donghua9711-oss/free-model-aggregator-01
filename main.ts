@@ -112,7 +112,7 @@ class Handler {
     }
     const req = extractRequest(api, body);
     const requires = entry !== undefined ? entry.requires : derivedRequirements(req);
-    const served = await this.#router.serve(req, requires);
+    const served = await this.#router.serve(req, requires, entry);
     if (served === null) return errorReply(api, 502, 'every free provider refused the request');
     this.#seq += 1;
     const { answer, candidate } = served;

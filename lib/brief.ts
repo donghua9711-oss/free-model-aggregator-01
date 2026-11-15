@@ -51,6 +51,8 @@ export interface Brief {
   /** Keyed `${provider}/${model}`. */
   rowByKey: Map<string, ModelRow>;
   manifest: ManifestRequest[];
+  /** The scorer's own best rating per manifest request id, from the brief. */
+  bestById: Map<string, number>;
 }
 
 /** The harness's own rule: only a `true` flag binds, and min_context is a floor. */
@@ -151,12 +153,24 @@ function parseManifest(doc: Record<string, unknown>): ManifestRequest[] {
   }));
 }
 
+function parseBest(doc: Record<string, unknown>): Map<string, number> {
+  const best = new Map<string, number>();
+  const list = Array.isArray(doc.best) ? doc.best : [];
+  for (const item of list) {
+    if (!isRecord(item)) continue;
+    const id = str(item.id);
+    if (id !== '' && typeof item.rating_milli === 'number') best.set(id, item.rating_milli);
+  }
+  return best;
+}
+
 export function parseBrief(text: string): Brief {
   const docs = documentsIn(text);
   const providers = parseProviders(docNamed(docs, '/providers/v1'));
-  const rows = parseRows(docNamed(docs, '/ratings/v1'));
+  const ratingsDoc = docNamed(docs, '/ratings/v1');
+  const rows = parseRows(ratingsDoc);
   const manifest = parseManifest(docNamed(docs, '/workload/v1'));
   const rowByKey = new Map<string, ModelRow>();
   for (const row of rows) rowByKey.set(`${row.provider}/${row.model}`, row);
-  return { providers, rows, rowByKey, manifest };
+  return { providers, rows, rowByKey, manifest, bestById: parseBest(ratingsDoc) };
 }
