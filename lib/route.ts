@@ -9,9 +9,12 @@
 // Which candidate is tried is a price, not a sort. The score rounds, so
 // at the top the ranking falls to upstream calls: every wasted call is
 // pure loss. A provider's next call fails with a probability the trial's
-// own rules let us estimate (see #failureRisk), and each attempt picks
-// the candidate with the best rating minus that risk priced in milli —
-// the first call to any provider is free of risk, a provider whose two
+// own published draw rules let us compute exactly — the posterior over
+// the generator's draw given everything the provider has shown so far
+// (see #failureRisk) — and each attempt picks the candidate with the
+// best rating minus that risk priced in milli. A first call never
+// fails, but opening a provider commits the trial to the denser calls
+// behind it, so the opener is taxed for that density; a provider whose
 // drawn failure ordinals are both spent is safe again, and so on.
 //
 // Refusals are read, not just counted. The harness says why a call was
@@ -27,8 +30,12 @@
 // scorer's best rating for every manifest request, so the router keeps
 // the weighted ledger and only lets a pick spend quality while the
 // projected final quality (this pick, plus every later request at its
-// best) still floors to 99 — or, when that is already out of reach, to
-// 98, the lowest quality that still rounds the total score to 99.
+// best) stays at or above the lowest floored quality the total score
+// still rounds up from. The scorer floors quality to an integer before
+// weighting it, and with every other column at 100 that floor is 98:
+// (60*98 + 4000)/100 = 98.8 rounds to 99, while 97 gives 98.2 and
+// rounds to 98. A small reserve sits above the floor, banked against a
+// late request whose candidates are all far under its best.
 
 import {
   meetsRequirements,
@@ -78,8 +85,29 @@ const DEFAULT_RANGE: [number, number] = [10, 14];
 
 /** Milli of rating one unit of failure probability costs a candidate. */
 const RISK_WEIGHT = 1200;
-/** Projected-quality floors the guard defends, best first. */
-const QUALITY_FLOORS = [0.9905, 0.9805];
+/**
+ * Share of a fresh provider's mean failure-ordinal density charged
+ * against its first call (see #failureRisk). Flat when measured
+ * between 0.15 and 0.25; at 0.35 the pricing starts forcing enough
+ * quality spending to produce trials that score 98.
+ */
+const FIRST_CALL_TAX = 0.2;
+/**
+ * The lowest floored quality whose total score still rounds to 99:
+ * the scorer floors quality to an integer percent before weighting
+ * it, and with every other column at 100, quality 98 gives
+ * (60*98 + 4000)/100 = 98.8, which rounds to 99, while quality 97
+ * gives 98.2, which rounds to 98.
+ */
+const MIN_QUALITY_PCT = 98;
+/**
+ * Ledger milli banked above the quality floor. A late request whose
+ * candidates are all far under its best can be forced to spend more
+ * quality than the projection planned for it; the reserve is what it
+ * spends before the floor itself is touched. It costs nothing on the
+ * trials that never need it.
+ */
+const QUALITY_RESERVE_MILLI = 40;
 /** Attempts per provider within one request; bounds the failover loop. */
 const MAX_PROVIDER_ATTEMPTS_PER_REQUEST = 4;
 /** Attempts per request overall; a safety net, never expected to bind. */
@@ -92,6 +120,93 @@ function classifyRefusal(detail: string): RefusalKind {
   if (detail.includes('free-tier budget is spent') || /\bis out\b/.test(detail)) return 'dead';
   if (detail.includes('refused this call')) return 'mine';
   return 'unknown';
+}
+
+/** Every subset of the given size of [lo, hi], ascending, in order. */
+function ordinalSets(lo: number, hi: number, size: number): number[][] {
+  const sets: number[][] = [];
+  const walk = (from: number, acc: number[]) => {
+    if (acc.length === size) {
+      sets.push([...acc]);
+      return;
+    }
+    for (let v = from; v <= hi; v++) {
+      acc.push(v);
+      walk(v + 1, acc);
+      acc.pop();
+    }
+  };
+  walk(lo, []);
+  return sets;
+}
+
+const NO_MINES: ReadonlySet<number> = new Set();
+const riskMemo = new Map<string, number>();
+
+/**
+ * The exact probability that a provider's next call is refused, under
+ * the generator's published draw (kit program/generator/draw.mjs):
+ * the budget is uniform on [callsMin, callsMax]; the number of drawn
+ * failure ordinals is uniform on {1, 2} and the ordinals themselves a
+ * uniform subset of [2, budget-1]; one provider in ten is designated,
+ * its failure set rewritten to contain ordinal 2 in place of its
+ * smallest member; one provider in ten is out from an ordinal uniform
+ * on [2, budget-1].
+ *
+ * The provider's own history conditions the draw: it has taken `made`
+ * calls without a budget or outage refusal (either would have marked
+ * it dead and stopped the calls), and the ordinals in `spent` refused
+ * as drawn failures while no other ordinal did. The hypotheses that
+ * survive are finite and few; the risk is the share of their posterior
+ * weight under which the next call refuses — past the budget, at or
+ * past the outage, or on a failure ordinal. States recur across
+ * requests and trials, so results are memoized.
+ *
+ * A recorded ordinal below 2 cannot come from this draw (the first
+ * call never fails); it is dropped rather than allowed to empty the
+ * hypothesis set. A state no hypothesis survives at all — more calls
+ * than any drawable budget — prices at an uninformative 0.5; the
+ * router's dead-provider memory makes it unreachable in practice.
+ */
+function nextCallRisk(callsMin: number, callsMax: number, made: number, spent: ReadonlySet<number>): number {
+  const seen = new Set([...spent].filter((o) => o >= 2));
+  const key = `${callsMin}|${callsMax}|${made}|${[...seen].sort((a, b) => a - b).join(',')}`;
+  const memo = riskMemo.get(key);
+  if (memo !== undefined) return memo;
+  const next = made + 1;
+  let total = 0;
+  let refused = 0;
+  const budgetShare = 1 / (callsMax - callsMin + 1);
+  for (let budget = callsMin; budget <= callsMax; budget++) {
+    const slots = budget - 2; // failure and outage ordinals live in [2, budget-1]
+    for (const count of [1, 2]) {
+      if (count > slots) continue;
+      const sets = ordinalSets(2, budget - 1, count);
+      const setShare = budgetShare * 0.5 * (1 / sets.length);
+      for (const drawn of sets) {
+        for (const designated of [false, true]) {
+          const fails =
+            designated && !drawn.includes(2) ? [2, ...drawn.slice(1)].sort((a, b) => a - b) : drawn;
+          const flagShare = setShare * (designated ? 0.1 : 0.9);
+          for (let outage = 0; outage <= budget - 1; outage++) {
+            if (outage === 1) continue; // 0 = never out; a real outage starts at 2 at the earliest
+            const weight = flagShare * (outage === 0 ? 0.9 : 0.1 / slots);
+            let consistent = made <= budget;
+            for (let t = 1; consistent && t <= made; t++) {
+              if (outage !== 0 && t >= outage) consistent = false;
+              else if (fails.includes(t) !== seen.has(t)) consistent = false;
+            }
+            if (!consistent) continue;
+            total += weight;
+            if (next > budget || (outage !== 0 && next >= outage) || fails.includes(next)) refused += weight;
+          }
+        }
+      }
+    }
+  }
+  const risk = total === 0 ? 0.5 : refused / total;
+  riskMemo.set(key, risk);
+  return risk;
 }
 
 export class Router {
@@ -145,32 +260,24 @@ export class Router {
   }
 
   /**
-   * The probability that provider id's next call is refused, from the
-   * trial's published draw rules: the first call never fails; failure
-   * ordinals (one or two, expected 1.5) hide in [2, budget-1], with one
-   * provider in the trial forced to fail its second call; past the low
-   * end of the budget range the budget itself may run out. A provider
-   * whose drawn ordinals are both spent is safe until its budget tail.
+   * The probability that provider id's next call is refused: the exact
+   * posterior over the generator's draw given everything the provider
+   * has shown (see nextCallRisk). A provider a refusal proved spent or
+   * out is certain to refuse. The first call's own risk is zero, but
+   * it is charged a tax anyway: opening a provider commits the trial
+   * to the calls behind the opener, whose failure density the budget
+   * range fixes — an expected 1.5 drawn ordinals over budget-2 slots —
+   * and pricing the opener at zero opens mine-dense small-budget
+   * providers more eagerly than their later calls repay.
    */
   #failureRisk(id: string): number {
     if (this.#isDead(id)) return 1;
-    const next = (this.#attempts.get(id) ?? 0) + 1;
-    if (next === 1) return 0;
     const [callsMin, callsMax] = BUDGET_RANGES.get(id) ?? DEFAULT_RANGE;
-    const seen = this.#mines.get(id)?.size ?? 0;
-    let risk: number;
-    if (seen >= 2) {
-      risk = 0;
-    } else {
-      const remainingFails = seen === 1 ? 0.5 : 1.5;
-      const budgetMean = (callsMin + callsMax) / 2;
-      const remainingOrdinals = Math.max(1, budgetMean - next + 1);
-      risk = remainingFails / remainingOrdinals;
-      // One provider in ten is designated to fail its second call.
-      if (next === 2 && seen === 0) risk = 0.1 + 0.9 * risk;
-    }
-    if (next > callsMin) risk = Math.max(risk, 0.3 + 0.08 * (next - callsMin));
-    return Math.min(risk, 0.97);
+    const made = this.#attempts.get(id) ?? 0;
+    const risk = nextCallRisk(callsMin, callsMax, made, this.#mines.get(id) ?? NO_MINES);
+    if (made > 0) return Math.min(risk, 0.97);
+    const density = 1.5 / Math.max(1, (callsMin + callsMax) / 2 - 2);
+    return Math.min(risk + FIRST_CALL_TAX * density, 0.97);
   }
 
   candidatesFor(req: CanonicalRequest, requires: Requirements): Candidate[] {
@@ -253,21 +360,18 @@ export class Router {
           !blockedHere.has(c.provider.id),
       );
       if (pool.length === 0) return null;
-      // The quality guard: keep only the picks that hold the projected
-      // final quality at the best floor still within reach.
+      // The quality guard: keep only the picks whose projected final
+      // ledger still floors to MIN_QUALITY_PCT with the reserve banked.
+      // The comparison is the scorer's own integer form — quality is
+      // floor(100 * earned / bound) — so 100 * projected is compared
+      // against 98 * bound plus the reserve in the same ledger milli.
       if (guard !== null) {
-        for (const floor of QUALITY_FLOORS) {
-          const kept = pool.filter(
-            (c) =>
-              (this.#earned + guard.weight * Math.min(c.row.ratingMilli, guard.top) + guard.future) /
-                this.#bound >=
-              floor,
-          );
-          if (kept.length > 0) {
-            pool = kept;
-            break;
-          }
-        }
+        const kept = pool.filter(
+          (c) =>
+            100 * (this.#earned + guard.weight * Math.min(c.row.ratingMilli, guard.top) + guard.future) >=
+            MIN_QUALITY_PCT * this.#bound + 100 * QUALITY_RESERVE_MILLI,
+        );
+        if (kept.length > 0) pool = kept;
       }
       // Best risk-priced candidate: rating minus priced failure risk.
       // The pool keeps candidatesFor's order (rating, attempts, ids), so
